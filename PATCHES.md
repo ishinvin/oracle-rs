@@ -1,8 +1,13 @@
 # Local patches
 
-Fork of [oracle-rs 0.1.7](https://crates.io/crates/oracle-rs/0.1.7) (MIT OR Apache-2.0,
-copyright Stian Grytøyr), used by DBX Lite. The first commit on this branch is the unmodified 0.1.7 package;
-everything after it is a local patch. Keep this list current so the crate can be rebased onto a newer upstream.
+Fork of [stiang/oracle-rs](https://github.com/stiang/oracle-rs) (MIT OR Apache-2.0, copyright Stian Grytøyr). This branch is based on upstream `main` (0.1.6); everything on top of it is a local patch.
+Keep this list current so the fork can be rebased onto a newer upstream:
+
+```sh
+git remote add upstream git@github.com:stiang/oracle-rs.git   # once
+git fetch upstream
+git rebase upstream/main
+```
 
 1. `Config::sysdba(bool)` / `Config::sysdba` — authenticate with the SYSDBA privilege.
    Upstream implements `AuthMessage::with_sysdba` but never exposes it through `Config`.
@@ -45,3 +50,7 @@ dblite reads LONG dictionary columns through inline `WITH FUNCTION ... RETURN CL
     when the data ends before the terminal message (ERROR / STATUS / END_OF_RESPONSE), and the caller reads the
     next packet and parses again. Live tests: `lob_columns_next_to_dates_and_other_types`,
     `repeated_values_and_multiple_pages_with_lob_columns`, `responses_larger_than_one_packet_are_reassembled`.
+
+13. Integration tests start a throwaway `gvenzl/oracle-free` container with testcontainers (`ctor` and
+    `testcontainers` dev-dependencies, `tests/integration_tests.rs`) instead of `tests/oracle/docker-compose.yml`,
+    which was removed. Set `ORACLE_CONNECT_STRING` or `ORACLE_HOST` to test against an existing instance.
