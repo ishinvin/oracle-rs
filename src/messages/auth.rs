@@ -463,40 +463,20 @@ impl AuthMessage {
         Ok(())
     }
 
-    /// Read a string in AUTH response format: indicator + length + length_confirm + data
+    /// Read a string from the AUTH response in ub4 + bytes_with_length format.
     ///
-    /// The indicator byte can be:
-    /// - 0: absent/empty string
-    /// - 1: string follows (length + length_confirm + data)
-    /// - 2: extra sub-indicator byte follows (used by Oracle 19c+)
+    /// Matches python-oracledb's `read_str_with_length`:
+    /// 1. Read a ub4 (variable-length u32) for the declared length
+    /// 2. If non-zero, read length-prefixed bytes for the actual string data
     fn read_auth_string(buf: &mut ReadBuffer) -> Result<String> {
-        let indicator = buf.read_u8()?;
-        if indicator == 0 {
+        let declared_len = buf.read_ub4()?;
+        if declared_len == 0 {
             return Ok(String::new());
         }
-
-        // Oracle 19c+ may use indicator=2, which prepends a sub-indicator byte
-        if indicator == 2 {
-            let sub_indicator = buf.read_u8()?;
-            if sub_indicator == 0 {
-                return Ok(String::new());
-            }
+        match buf.read_bytes_with_length()? {
+            Some(bytes) => Ok(String::from_utf8_lossy(&bytes).to_string()),
+            None => Ok(String::new()),
         }
-
-        // Read length and length confirmation
-        let len = buf.read_u8()? as usize;
-        let len_confirm = buf.read_u8()? as usize;
-
-        // Oracle 19c encodes the length differently (len can be len_confirm * 3).
-        // len_confirm is the actual byte count of the data that follows.
-        let actual_len = if len != len_confirm { len_confirm } else { len };
-
-        if actual_len == 0 {
-            return Ok(String::new());
-        }
-
-        let bytes = buf.read_bytes_vec(actual_len)?;
-        Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
     /// Generate the verifier (session keys and combo key)
@@ -751,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn test_read_auth_string_indicator_0() {
-        // indicator=0 means empty/absent
+    fn test_read_auth_string_zero_length() {
+        // ub4(0) = [0x00] → empty string
         let data = [0x00];
         let mut buf = ReadBuffer::from_slice(&data);
         let result = AuthMessage::read_auth_string(&mut buf).unwrap();
@@ -760,8 +740,8 @@ mod tests {
     }
 
     #[test]
-    fn test_read_auth_string_indicator_1() {
-        // indicator=1, len=5, len_confirm=5, data="HELLO"
+    fn test_read_auth_string_with_data() {
+        // ub4(5) = [0x01, 0x05], then bytes_with_length: [0x05, "HELLO"]
         let data = [0x01, 0x05, 0x05, b'H', b'E', b'L', b'L', b'O'];
         let mut buf = ReadBuffer::from_slice(&data);
         let result = AuthMessage::read_auth_string(&mut buf).unwrap();
@@ -769,37 +749,9 @@ mod tests {
     }
 
     #[test]
-    fn test_read_auth_string_indicator_2_with_data() {
-        // indicator=2, sub_indicator=1, len=3, len_confirm=3, data="ABC"
-        let data = [0x02, 0x01, 0x03, 0x03, b'A', b'B', b'C'];
-        let mut buf = ReadBuffer::from_slice(&data);
-        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
-        assert_eq!(result, "ABC");
-    }
-
-    #[test]
-    fn test_read_auth_string_indicator_2_absent() {
-        // indicator=2, sub_indicator=0 means absent
-        let data = [0x02, 0x00];
-        let mut buf = ReadBuffer::from_slice(&data);
-        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
-        assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_read_auth_string_length_mismatch() {
-        // Oracle 19c: len != len_confirm, use len_confirm as actual length
-        // len=9 (3*3), len_confirm=3, data="XYZ"
-        let data = [0x01, 0x09, 0x03, b'X', b'Y', b'Z'];
-        let mut buf = ReadBuffer::from_slice(&data);
-        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
-        assert_eq!(result, "XYZ");
-    }
-
-    #[test]
-    fn test_read_auth_string_empty_data() {
-        // indicator=1, len=0, len_confirm=0
-        let data = [0x01, 0x00, 0x00];
+    fn test_read_auth_string_null_bytes() {
+        // ub4(5) = [0x01, 0x05], then bytes_with_length returns NULL: [0xFF]
+        let data = [0x01, 0x05, 0xFF];
         let mut buf = ReadBuffer::from_slice(&data);
         let result = AuthMessage::read_auth_string(&mut buf).unwrap();
         assert_eq!(result, "");

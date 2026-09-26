@@ -70,6 +70,8 @@ pkcs8 = { version = "0.10", features = ["encryption", "pem"] }
 indexmap = "2"
 
 [dev-dependencies]
+ctor = "0.2"
+testcontainers = { version = "0.17.0", features = ["blocking"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
 tokio-test = "0.4"
 
