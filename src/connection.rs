@@ -4579,9 +4579,12 @@ impl Connection {
             return self.parse_lob_error(&mut buf);
         }
 
-        // Parse LOB data response
-        let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_lob_read_response(payload, locator)
+        // Parse LOB data response. The trailing locator may straddle a packet
+        // boundary, which the terminal-message scan cannot tell from the end.
+        Self::parse_across_packets(&mut inner, &response, |payload| {
+            self.parse_lob_read_response(payload, locator)
+        })
+        .await
     }
 
     /// Parse LOB read response
