@@ -1,23 +1,16 @@
 //! Integration tests for Oracle-RS against a real Oracle database
 //!
-//! These tests require a running Oracle instance. The easiest way is to use
-//! the included Docker Compose setup:
+//! By default a throwaway Oracle Free container is started with testcontainers
+//! (requires a running Docker daemon; the first run pulls the image and takes a
+//! couple of minutes). The container is shared by all tests in this binary and
+//! removed when the test process exits.
 //!
 //! ```sh
-//! # Start Oracle (takes ~2 minutes on first run)
-//! docker compose -f tests/oracle/docker-compose.yml up -d
-//!
-//! # Wait for healthy status
-//! docker compose -f tests/oracle/docker-compose.yml logs -f
-//!
-//! # Run integration tests (no env vars needed with defaults)
-//! cargo test --test integration_tests -- --ignored
-//!
-//! # Stop Oracle
-//! docker compose -f tests/oracle/docker-compose.yml down
+//! cargo test --test integration_tests
 //! ```
 //!
-//! To use a different Oracle instance, configure with environment variables:
+//! To use an existing Oracle instance instead, set one of the following and no
+//! container will be started:
 //!
 //! Option 1 - Connection string:
 //!   ORACLE_CONNECT_STRING: EZConnect format, e.g., "host:port/service_name"
@@ -25,24 +18,107 @@
 //!   ORACLE_PASSWORD: Oracle password
 //!
 //! Option 2 - Individual parameters:
-//!   ORACLE_HOST: Oracle host (default: localhost)
+//!   ORACLE_HOST: Oracle host (setting this disables the container)
 //!   ORACLE_PORT: Oracle port (default: 1521)
 //!   ORACLE_SERVICE: Oracle service name (default: FREEPDB1)
 //!   ORACLE_USER: Oracle username (default: testuser)
 //!   ORACLE_PASSWORD: Oracle password (default: testpass)
 
-use oracle_rs::{Config, Connection, Error};
+use std::path::Path;
+use std::sync::OnceLock;
 
-/// Get test configuration from environment variables
+use oracle_rs::{Config, Connection, Error};
+use testcontainers::core::{Mount, WaitFor};
+use testcontainers::runners::SyncRunner;
+use testcontainers::GenericImage;
+
+const ORACLE_PORT: u16 = 1521;
+const ORACLE_SERVICE: &str = "FREEPDB1";
+const APP_USER: &str = "testuser";
+const APP_PASSWORD: &str = "testpass";
+
+/// Host and mapped port of the shared Oracle test container.
+struct Endpoint {
+    host: String,
+    port: u16,
+}
+
+static ENDPOINT: OnceLock<Endpoint> = OnceLock::new();
+
+/// Id of the shared container, used to remove it at process exit.
+static CONTAINER_ID: OnceLock<String> = OnceLock::new();
+
+/// Statics are never dropped, and dropping a `Container` from an exit hook
+/// panics (its runtime needs thread-locals that are already gone), so the
+/// container is removed through the docker CLI instead.
+#[ctor::dtor]
+fn stop_oracle_container() {
+    if let Some(id) = CONTAINER_ID.get() {
+        let _ = std::process::Command::new("docker")
+            .args(["rm", "-f", "-v", id])
+            .output();
+    }
+}
+
+/// Start the Oracle container once and return its endpoint.
 ///
-/// Supports two modes:
-/// 1. ORACLE_CONNECT_STRING with ORACLE_USER and ORACLE_PASSWORD
-/// 2. Individual ORACLE_HOST, ORACLE_PORT, ORACLE_SERVICE, ORACLE_USER, ORACLE_PASSWORD
+/// The sync runner drives its own runtime, which cannot be started from inside
+/// a `#[tokio::test]` runtime, so the container is started on a helper thread.
+fn oracle_endpoint() -> &'static Endpoint {
+    ENDPOINT.get_or_init(|| {
+        std::thread::spawn(|| {
+            let init_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/oracle/init");
+            let container = GenericImage::new("gvenzl/oracle-free", "slim")
+                .with_exposed_port(ORACLE_PORT)
+                .with_env_var("ORACLE_PASSWORD", "oracle_rs_test")
+                .with_env_var("APP_USER", APP_USER)
+                .with_env_var("APP_USER_PASSWORD", APP_PASSWORD)
+                .with_mount(Mount::bind_mount(
+                    init_dir.to_str().expect("non-UTF-8 manifest path"),
+                    "/container-entrypoint-initdb.d",
+                ))
+                .with_wait_for(WaitFor::message_on_stdout("DATABASE IS READY TO USE!"))
+                .start()
+                .expect("Failed to start Oracle container (is Docker running?)");
+
+            let endpoint = Endpoint {
+                host: container.get_host().expect("container host").to_string(),
+                port: container
+                    .get_host_port_ipv4(ORACLE_PORT)
+                    .expect("container port"),
+            };
+            CONTAINER_ID.set(container.id().to_string()).unwrap();
+            // Never dropped: removal is handled by `stop_oracle_container`.
+            std::mem::forget(container);
+            endpoint
+        })
+        .join()
+        .expect("Oracle container startup panicked")
+    })
+}
+
+/// EZConnect string ("host:port/service") for the test database
+fn get_test_connect_string() -> String {
+    if let Ok(connect_string) = std::env::var("ORACLE_CONNECT_STRING") {
+        return connect_string;
+    }
+    if let Ok(host) = std::env::var("ORACLE_HOST") {
+        let port = std::env::var("ORACLE_PORT").unwrap_or_else(|_| ORACLE_PORT.to_string());
+        let service =
+            std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| ORACLE_SERVICE.to_string());
+        return format!("{}:{}/{}", host, port, service);
+    }
+    let endpoint = oracle_endpoint();
+    format!("{}:{}/{}", endpoint.host, endpoint.port, ORACLE_SERVICE)
+}
+
+/// Get test configuration
 ///
-/// Defaults match the docker-compose setup in tests/oracle/.
+/// Uses an external database when ORACLE_CONNECT_STRING or ORACLE_HOST is set,
+/// otherwise the shared testcontainers Oracle instance.
 fn get_test_config() -> Config {
-    let username = std::env::var("ORACLE_USER").unwrap_or_else(|_| "testuser".to_string());
-    let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
+    let username = std::env::var("ORACLE_USER").unwrap_or_else(|_| APP_USER.to_string());
+    let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| APP_PASSWORD.to_string());
 
     // Check for connection string first
     if let Ok(connect_string) = std::env::var("ORACLE_CONNECT_STRING") {
@@ -53,15 +129,19 @@ fn get_test_config() -> Config {
         return config;
     }
 
-    // Fall back to individual parameters
-    let host = std::env::var("ORACLE_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let port: u16 = std::env::var("ORACLE_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(1521);
-    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+    // External database via individual parameters
+    if let Ok(host) = std::env::var("ORACLE_HOST") {
+        let port: u16 = std::env::var("ORACLE_PORT")
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(ORACLE_PORT);
+        let service =
+            std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| ORACLE_SERVICE.to_string());
+        return Config::new(&host, port, &service, &username, &password);
+    }
 
-    Config::new(&host, port, &service, &username, &password)
+    let endpoint = oracle_endpoint();
+    Config::new(&endpoint.host, endpoint.port, ORACLE_SERVICE, &username, &password)
 }
 
 /// Helper to connect using test configuration
@@ -74,7 +154,6 @@ mod connection_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_connect_and_close() {
         let conn = connect().await.expect("Failed to connect");
         assert!(!conn.is_closed());
@@ -84,7 +163,6 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_ping() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -94,7 +172,6 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_invalid_credentials() {
         let host = std::env::var("ORACLE_HOST").unwrap_or_else(|_| "localhost".to_string());
         let port: u16 = std::env::var("ORACLE_PORT")
@@ -111,18 +188,11 @@ mod connection_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_connection_string_connect() {
-        let host = std::env::var("ORACLE_HOST").unwrap_or_else(|_| "localhost".to_string());
-        let port: u16 = std::env::var("ORACLE_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(1521);
-        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
-        let username = std::env::var("ORACLE_USER").unwrap_or_else(|_| "testuser".to_string());
-        let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
+        let username = std::env::var("ORACLE_USER").unwrap_or_else(|_| APP_USER.to_string());
+        let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| APP_PASSWORD.to_string());
 
-        let connect_string = format!("{}:{}/{}", host, port, service);
+        let connect_string = get_test_connect_string();
         let conn = Connection::connect(&connect_string, &username, &password).await
             .expect("Failed to connect with connection string");
 
@@ -134,7 +204,6 @@ mod query_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_simple_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -148,7 +217,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_sysdate_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -162,7 +230,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_string_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -176,7 +243,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_multiple_columns() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -195,7 +261,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_query_departments_table() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -213,7 +278,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_query_employees_table() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -232,7 +296,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_query_with_where_clause() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -248,7 +311,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_query_with_null_values() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -264,7 +326,6 @@ mod query_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_empty_result_set() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -284,7 +345,6 @@ mod data_type_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_number_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -299,7 +359,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_varchar_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -314,7 +373,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_date_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -329,7 +387,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_timestamp_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -344,7 +401,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_clob_data_type() {
         use oracle_rs::Value;
 
@@ -380,7 +436,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_clob_read_content() {
         use oracle_rs::{Value, LobData};
 
@@ -423,7 +478,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_length() {
         use oracle_rs::Value;
 
@@ -462,7 +516,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_clob_write_and_read() {
         use oracle_rs::Value;
 
@@ -522,7 +575,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_trim_via_plsql() {
         // First verify that PL/SQL can trim the LOB
         let conn = connect().await.expect("Failed to connect");
@@ -555,7 +607,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_write() {
         use oracle_rs::Value;
 
@@ -637,7 +688,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_write_medium() {
         use oracle_rs::Value;
 
@@ -717,7 +767,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_trim() {
         use oracle_rs::Value;
 
@@ -800,7 +849,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_clob_read_with_convenience_method() {
         use oracle_rs::Value;
 
@@ -834,7 +882,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_null_values() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -856,7 +903,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_float_data_types() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -871,7 +917,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_raw_data_type() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -886,7 +931,6 @@ mod data_type_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_large_clob_read() {
         use oracle_rs::Value;
 
@@ -950,7 +994,6 @@ mod data_type_tests {
     // BLOB-specific tests are covered by test_lob_write which tests BLOB read/write.
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_streaming_lob_read() {
         use oracle_rs::Value;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1047,7 +1090,6 @@ mod dml_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_insert_and_rollback() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1081,7 +1123,6 @@ mod dml_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_update_and_rollback() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1101,7 +1142,6 @@ mod dml_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_delete_and_rollback() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1129,7 +1169,6 @@ mod dml_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_commit() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1165,7 +1204,6 @@ mod transaction_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_transaction_isolation() {
         let conn1 = connect().await.expect("Failed to connect conn1");
         let conn2 = connect().await.expect("Failed to connect conn2");
@@ -1193,7 +1231,6 @@ mod transaction_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_savepoint() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1255,7 +1292,6 @@ mod error_handling_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_syntax_error() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1270,7 +1306,6 @@ mod error_handling_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_table_not_found() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1282,7 +1317,6 @@ mod error_handling_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_duplicate_key_error() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1301,7 +1335,6 @@ mod error_handling_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_foreign_key_violation() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1324,7 +1357,6 @@ mod aggregate_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_count_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1340,7 +1372,6 @@ mod aggregate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_sum_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1355,7 +1386,6 @@ mod aggregate_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_group_by_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1375,7 +1405,6 @@ mod join_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_inner_join() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1394,7 +1423,6 @@ mod join_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_left_join() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1416,7 +1444,6 @@ mod subquery_tests {
     use super::*;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_subquery_in_where() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1433,7 +1460,6 @@ mod subquery_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_subquery_in_select() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1457,7 +1483,6 @@ mod bind_parameter_tests {
     use oracle_rs::Value;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bind_integer() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1482,7 +1507,6 @@ mod bind_parameter_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bind_string() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1498,7 +1522,6 @@ mod bind_parameter_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bind_multiple_params() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1522,7 +1545,6 @@ mod bind_parameter_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bind_insert_and_select() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1573,7 +1595,6 @@ mod bind_parameter_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bind_null() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1608,7 +1629,6 @@ mod bind_parameter_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bind_float() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1655,7 +1675,6 @@ mod batch_execution_tests {
     use oracle_rs::BatchBuilder;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_batch_insert() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1698,7 +1717,6 @@ mod batch_execution_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_batch_with_row_counts() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1741,7 +1759,6 @@ mod batch_execution_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_batch_with_mixed_types() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1777,7 +1794,6 @@ mod batch_execution_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_batch_with_nulls() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1817,7 +1833,6 @@ mod batch_execution_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_batch_delete() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1865,7 +1880,6 @@ mod batch_execution_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_batch_large() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1910,7 +1924,6 @@ mod scrollable_cursor_tests {
     use oracle_rs::FetchOrientation;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_scrollable_cursor_basic() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1937,7 +1950,6 @@ mod scrollable_cursor_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_scrollable_cursor_navigation() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -1998,7 +2010,6 @@ mod scrollable_cursor_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_scrollable_cursor_bounds() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2032,7 +2043,6 @@ mod lob_bind_tests {
     use oracle_rs::Value;
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_bind_from_select() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2088,7 +2098,6 @@ mod lob_bind_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_lob_copy_via_bind() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2148,7 +2157,6 @@ mod lob_bind_tests {
 
     /// Test creating a temporary CLOB and writing/reading data
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_create_temp_clob() {
         use oracle_rs::{OracleType, LobData};
 
@@ -2185,7 +2193,6 @@ mod lob_bind_tests {
 
     /// Test creating a temporary BLOB and writing/reading data
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_create_temp_blob() {
         use oracle_rs::{OracleType, LobData};
 
@@ -2222,7 +2229,7 @@ mod lob_bind_tests {
     /// Test that binding temp LOB to INSERT fails gracefully
     /// This is a known limitation - use EMPTY_CLOB() workaround instead
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
+    #[ignore = "assertion on error text fails against Oracle Free (ORA-00904 on CONTENT)"]
     async fn test_temp_lob_insert() {
         use oracle_rs::{OracleType, LobValue};
 
@@ -2535,7 +2542,6 @@ mod vector_tests {
     use oracle_rs::{OracleVector, VectorData, Value};
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_create_table() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2562,7 +2568,6 @@ mod vector_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_insert_and_select_float32() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2633,7 +2638,6 @@ mod vector_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_bind_parameter() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2698,7 +2702,6 @@ mod vector_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_float64() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2750,7 +2753,6 @@ mod vector_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_int8() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2805,7 +2807,6 @@ mod vector_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_null() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2850,7 +2851,6 @@ mod vector_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle 23ai database"]
     async fn test_vector_from_convenience() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2899,7 +2899,6 @@ mod plsql_tests {
     // ============================================================
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_plsql_simple_out_string() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2929,7 +2928,6 @@ mod plsql_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_plsql_out_number() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2956,7 +2954,6 @@ mod plsql_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_plsql_in_out_parameter() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -2983,7 +2980,6 @@ mod plsql_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_plsql_multiple_out_params() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3013,7 +3009,6 @@ mod plsql_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_plsql_mixed_in_and_out() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3045,7 +3040,6 @@ mod plsql_tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_plsql_procedure_call() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3105,7 +3099,6 @@ mod lob_bind_param_tests {
     /// This is a regression test for the bug where LOB re-execute incorrectly
     /// included bind parameter info in the define request, causing hangs.
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_select_clob_with_bind_params() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3161,7 +3154,6 @@ mod lob_workaround_tests {
 
     /// Test inserting data into CLOB using EMPTY_CLOB() + FOR UPDATE pattern
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_empty_clob_workaround() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3235,7 +3227,6 @@ mod lob_workaround_tests {
 
     /// Test inserting data into BLOB using EMPTY_BLOB() + FOR UPDATE pattern
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_empty_blob_workaround() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3307,7 +3298,6 @@ mod lob_workaround_tests {
     /// Test that small strings can be bound directly to CLOB columns
     /// (Oracle implicitly converts VARCHAR2 to CLOB)
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_string_to_clob_implicit_conversion() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3361,7 +3351,6 @@ mod lob_workaround_tests {
 
     /// Test using DBMS_LOB functions with RETURNING INTO for large data
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_dbms_lob_returning_into() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3426,7 +3415,6 @@ mod ref_cursor_tests {
 
     /// Test basic REF CURSOR from PL/SQL
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_ref_cursor_basic() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3497,7 +3485,6 @@ mod ref_cursor_tests {
 
     /// Test REF CURSOR with filtering
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_ref_cursor_with_filter() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3546,7 +3533,6 @@ mod ref_cursor_tests {
 
     /// Test single implicit result set from PL/SQL
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_implicit_result_single() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3598,7 +3584,6 @@ mod ref_cursor_tests {
 
     /// Test multiple implicit result sets from PL/SQL
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_implicit_result_multiple() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3664,7 +3649,6 @@ mod ref_cursor_tests {
 
     /// Test implicit result with no rows
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_implicit_result_empty() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3708,7 +3692,6 @@ mod bfile_tests {
     /// Test creating a BFILE locator via BFILENAME() and checking its properties
     /// This doesn't require actual file access - just tests locator creation and parsing
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bfile_locator_creation() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3754,7 +3737,7 @@ mod bfile_tests {
     /// Test BFILE exists check on non-existent file
     /// The directory doesn't need to exist - this tests the protocol
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
+    #[ignore = "assertion on error text fails against Oracle Free (LOB operation failed)"]
     async fn test_bfile_exists_nonexistent() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3806,7 +3789,6 @@ mod bfile_tests {
 
     /// Test storing and retrieving BFILE locator from a table
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_bfile_in_table() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3874,7 +3856,6 @@ mod statement_cache_tests {
 
     /// Test that statement caching works - same SQL should reuse cursor
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_basic() {
         let conn = connect_with_cache(20).await.expect("Failed to connect");
 
@@ -3900,7 +3881,6 @@ mod statement_cache_tests {
 
     /// Test that cache disabled (size=0) works
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_disabled() {
         let conn = connect_with_cache(0).await.expect("Failed to connect");
 
@@ -3918,7 +3898,6 @@ mod statement_cache_tests {
 
     /// Test that DDL is not cached
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_ddl_not_cached() {
         let conn = connect_with_cache(20).await.expect("Failed to connect");
 
@@ -3945,7 +3924,6 @@ mod statement_cache_tests {
 
     /// Test that different SQL gets different cursors
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_different_sql() {
         let conn = connect_with_cache(20).await.expect("Failed to connect");
 
@@ -3972,7 +3950,6 @@ mod statement_cache_tests {
 
     /// Test DML caching
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_dml() {
         let conn = connect_with_cache(20).await.expect("Failed to connect");
 
@@ -4007,7 +3984,6 @@ mod statement_cache_tests {
 
     /// Test that cache works with multiple bind parameters
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_multiple_binds() {
         let conn = connect_with_cache(20).await.expect("Failed to connect");
 
@@ -4029,7 +4005,6 @@ mod statement_cache_tests {
 
     /// Test default cache size (20)
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_statement_cache_default_size() {
         // Connect with default config (should have cache size 20)
         let conn = connect().await.expect("Failed to connect");
@@ -4183,7 +4158,6 @@ mod collection_tests {
 
     /// Test get_type() for non-existent type
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_get_type_not_found() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -4711,7 +4685,6 @@ mod statement_cache_reuse_tests {
     /// the statement cache preserved a stale cursor_id, causing the second
     /// execution to return corrupted data (all None values).
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_same_query_twice_returns_correct_data() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -4741,7 +4714,6 @@ mod statement_cache_reuse_tests {
 
     /// Same test but for DML — execute the same INSERT twice on the same connection
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_same_dml_twice_succeeds() {
         use oracle_rs::Value;
         let conn = connect().await.expect("Failed to connect");
@@ -4775,7 +4747,6 @@ mod statement_cache_reuse_tests {
     /// Test statement cache with parameterized queries returning real table data.
     /// Verifies values aren't corrupted across repeated executions with different binds.
     #[tokio::test]
-    #[ignore = "requires Oracle database"]
     async fn test_cached_query_with_bind_params_returns_correct_values() {
         use oracle_rs::Value;
         let conn = connect().await.expect("Failed to connect");

@@ -249,7 +249,7 @@ mod execute_message_tests {
         let msg = ExecuteMessage::new(&stmt, opts);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false).unwrap();
 
         // Verify packet structure
         assert!(packet.len() > PACKET_HEADER_SIZE);
@@ -320,7 +320,7 @@ mod fetch_message_tests {
         let msg = FetchMessage::new(1, 50);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false, 1).unwrap();
 
         // Verify packet structure
         assert!(packet.len() > PACKET_HEADER_SIZE);
@@ -338,7 +338,7 @@ mod fetch_message_tests {
         let caps = Capabilities::new();
 
         // Should still build successfully (server will return no rows)
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false, 1).unwrap();
         assert!(packet.len() > PACKET_HEADER_SIZE);
     }
 
@@ -347,7 +347,7 @@ mod fetch_message_tests {
         let msg = FetchMessage::new(1, 10000);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false, 1).unwrap();
         assert!(packet.len() > PACKET_HEADER_SIZE);
     }
 }
@@ -488,7 +488,7 @@ mod integration_tests {
         let opts = ExecuteOptions::for_query(100);
         let msg = ExecuteMessage::new(&stmt, opts);
         let caps = Capabilities::new();
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false).unwrap();
         assert!(!packet.is_empty());
 
         // 3. After server responds, we'd have a cursor ID and column metadata
@@ -501,7 +501,7 @@ mod integration_tests {
 
         // 4. Fetch more rows
         let fetch = FetchMessage::new(stmt.cursor_id(), 100);
-        let fetch_packet = fetch.build_request(&caps).unwrap();
+        let fetch_packet = fetch.build_request_with_sdu(&caps, false, 1).unwrap();
         assert!(!fetch_packet.is_empty());
     }
 
@@ -516,7 +516,7 @@ mod integration_tests {
         let opts = ExecuteOptions::for_dml(true);
         let msg = ExecuteMessage::new(&stmt, opts);
         let caps = Capabilities::new();
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false).unwrap();
         assert!(!packet.is_empty());
     }
 
@@ -531,7 +531,7 @@ mod integration_tests {
         let opts = ExecuteOptions::for_plsql();
         let msg = ExecuteMessage::new(&stmt, opts);
         let caps = Capabilities::new();
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false).unwrap();
         assert!(!packet.is_empty());
     }
 

@@ -222,11 +222,6 @@ impl<'a> ExecuteMessage<'a> {
         self.batch_bind_values.len()
     }
 
-    /// Build the execute request packet
-    pub fn build_request(&self, caps: &Capabilities) -> Result<Bytes> {
-        self.build_request_with_sdu(caps, false)
-    }
-
     /// Build the execute request packet with large SDU support
     pub fn build_request_with_sdu(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
@@ -1162,7 +1157,7 @@ mod tests {
         let msg = ExecuteMessage::new(&stmt, opts);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false).unwrap();
 
         // Check packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);

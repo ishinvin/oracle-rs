@@ -26,7 +26,7 @@
 //! }
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -411,10 +411,27 @@ impl ConnectionInner {
             // Combine header and payload
             let mut full_packet = header_buf.clone();
             full_packet.extend(payload_buf);
+            if std::env::var_os("ORACLE_RS_TRACE").is_some() {
+                eprintln!("[oracle-rs] recv type={} len={} head={:02x?}", full_packet[4], full_packet.len(), &full_packet[..full_packet.len().min(if full_packet.len() < 200 { 200 } else { 24 })]);
+            }
 
             Ok(bytes::Bytes::from(full_packet))
         } else {
             Err(Error::ConnectionClosed)
+        }
+    }
+
+    /// Appends the next DATA packet's message bytes (minus its data flags) to a
+    /// response that outgrew a single TNS packet. Returns false when no further
+    /// packet arrives, so the caller reports the original parse error instead.
+    async fn append_next_packet(&mut self, response: &mut Vec<u8>) -> bool {
+        let next = tokio::time::timeout(std::time::Duration::from_secs(10), self.receive()).await;
+        match next {
+            Ok(Ok(packet)) if packet.len() > PACKET_HEADER_SIZE + 2 && packet[4] == PacketType::Data as u8 => {
+                response.extend_from_slice(&packet[PACKET_HEADER_SIZE + 2..]);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -605,9 +622,14 @@ impl ConnectionInner {
         let payload_len = 3; // 0x01, 0x00, marker_type
         let total_len = (PACKET_HEADER_SIZE + payload_len) as u16;
 
-        // Header
-        buf.write_u16_be(total_len)?;
-        buf.write_u16_be(0)?; // zeros in large_sdu position
+        // Header: with a large SDU the length field is 32 bits wide (the checksum
+        // field that follows it in the classic layout does not exist).
+        if self.large_sdu {
+            buf.write_u32_be(total_len as u32)?;
+        } else {
+            buf.write_u16_be(total_len)?;
+            buf.write_u16_be(0)?; // packet checksum
+        }
         buf.write_u8(PacketType::Marker as u8)?;
         buf.write_u8(0)?; // flags
         buf.write_u16_be(0)?; // reserved
@@ -730,6 +752,10 @@ pub struct Connection {
     config: Config,
     closed: AtomicBool,
     id: u32,
+    /// TTC field version negotiated with the server. Synchronous response
+    /// parsers need it (error info carries extra fields from 20c on), and the
+    /// connection state sits behind an async mutex.
+    ttc_field_version: AtomicU8,
 }
 
 // Connection ID counter
@@ -805,12 +831,28 @@ impl Connection {
             config,
             closed: AtomicBool::new(false),
             id,
+            ttc_field_version: AtomicU8::new(crate::constants::ccap_value::FIELD_VERSION_MAX),
         };
 
         // Perform connection handshake
         conn.perform_handshake().await?;
 
         Ok(conn)
+    }
+
+    /// A connection that never dialed anything: every operation fails with a
+    /// connection error. Intended for tests that need a `Connection` value
+    /// without a database.
+    pub fn disconnected(config: Config) -> Self {
+        let id = CONNECTION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let inner = ConnectionInner::new_with_cache(0);
+        Connection {
+            inner: Arc::new(Mutex::new(inner)),
+            config,
+            closed: AtomicBool::new(false),
+            id,
+            ttc_field_version: AtomicU8::new(crate::constants::ccap_value::FIELD_VERSION_MAX),
+        }
     }
 
     /// Get the connection ID
@@ -976,10 +1018,37 @@ impl Connection {
                     let mut buf = ReadBuffer::new(response.slice(PACKET_HEADER_SIZE..));
                     let _reason = buf.read_u8()?;
                     let _user_reason = buf.read_u8()?;
-
-                    return Err(Error::ConnectionRefused {
-                        error_code: None,
-                        message: Some("Connection refused by server".to_string()),
+                    // The listener explains itself in a descriptor such as `(DESCRIPTION=(ERR=12514)...)`.
+                    let detail = buf
+                        .read_u16_be()
+                        .ok()
+                        .filter(|length| *length > 0)
+                        .and_then(|length| buf.read_bytes_vec(length as usize).ok())
+                        .map(|bytes| String::from_utf8_lossy(&bytes).to_string());
+                    let code = detail.as_deref().and_then(|text| {
+                        ["(ERR=", "(CODE="].iter().find_map(|key| {
+                            let start = text.find(key)? + key.len();
+                            let end = text[start..].find(')')?;
+                            text[start..start + end].trim().parse::<u32>().ok()
+                        })
+                    });
+                    let explanation = match code {
+                        Some(12514) => Some("TNS:listener does not currently know of service requested in connect descriptor"),
+                        Some(12505) => Some("TNS:listener does not currently know of SID given in connect descriptor"),
+                        Some(12516) => Some("TNS:listener could not find available handler with matching protocol stack"),
+                        Some(12519) => Some("TNS:no appropriate service handler found"),
+                        Some(12520) => Some("TNS:listener could not find available handler for requested type of server"),
+                        Some(12521) => Some("TNS:listener does not currently know of instance requested in connect descriptor"),
+                        Some(12528) => Some("TNS:listener: all appropriate instances are blocking new connections"),
+                        Some(12537) => Some("TNS:connection closed"),
+                        _ => None,
+                    };
+                    return Err(match (code, explanation) {
+                        (Some(code), Some(text)) => Error::OracleError { code, message: format!("ORA-{code:05}: {text}") },
+                        (code, _) => Error::ConnectionRefused {
+                            error_code: code,
+                            message: detail.or_else(|| Some("Connection refused by server".to_string())),
+                        },
                     });
                 }
                 5 => {
@@ -1037,6 +1106,7 @@ impl Connection {
         let payload = &response[PACKET_HEADER_SIZE..];
         let mut protocol_msg = ProtocolMessage::new();
         protocol_msg.parse_response(payload, &mut inner.capabilities)?;
+        self.ttc_field_version.store(inner.capabilities.ttc_field_version, Ordering::Relaxed);
 
         // Update server info with banner
         if let Some(banner) = &protocol_msg.server_banner {
@@ -1085,6 +1155,9 @@ impl Connection {
             self.config.password().as_bytes(),
             &service_name,
         );
+        if self.config.sysdba {
+            auth = auth.with_sysdba();
+        }
 
         // Phase one: send username and session info
         {
@@ -1126,8 +1199,22 @@ impl Connection {
             // Check for error message type or marker
             let packet_type = response[4];
             if packet_type == 12 {
-                // Marker - authentication failed
-                return Err(Error::AuthenticationFailed("Server sent MARKER - authentication rejected".to_string()));
+                // The server interrupted the login with an error. Run the reset handshake to
+                // read its details; when it just closes the socket (what a failed logon does
+                // on most releases) the cause is a rejected credential.
+                let reason = match inner.handle_marker_reset().await {
+                    Ok(packet) if packet.len() > PACKET_HEADER_SIZE => {
+                        self.parse_error_response(&packet[PACKET_HEADER_SIZE..]).err()
+                    }
+                    _ => None,
+                };
+                return Err(match reason {
+                    Some(error @ Error::OracleError { .. }) => error,
+                    _ => Error::OracleError {
+                        code: 1017,
+                        message: "ORA-01017: invalid credential or not authorized; logon denied".to_string(),
+                    },
+                });
             }
 
             if response.len() > PACKET_HEADER_SIZE + 2 {
@@ -1778,20 +1865,28 @@ impl Connection {
         let fetch_msg = FetchMessage::new(cursor_id, fetch_size);
 
         let mut inner = self.inner.lock().await;
-        let request = fetch_msg.build_request(&inner.capabilities)?;
+        let large_sdu = inner.large_sdu;
+        let sequence_number = inner.next_sequence_number();
+        let request = fetch_msg.build_request_with_sdu(&inner.capabilities, large_sdu, sequence_number)?;
         inner.send(&request).await?;
 
         // Receive and parse response
-        let response = inner.receive().await?;
+        let mut response = inner.receive().await?;
+        if response.len() > 4 && response[4] == PacketType::Marker as u8 {
+            // The server interrupted the fetch with an error: run the reset
+            // handshake to reach the packet that carries the error details.
+            response = inner.handle_marker_reset().await?;
+        }
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty fetch response".to_string()));
         }
 
         // Parse row data from response
-        let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
-        drop(inner); // Release lock before parsing
-        self.parse_fetch_response(payload, columns, &caps)
+        Self::parse_across_packets(&mut inner, &response, |payload| {
+            self.parse_fetch_response(payload, columns, &caps)
+        })
+        .await
     }
 
     /// Fetch rows from a REF CURSOR
@@ -1889,10 +1984,11 @@ impl Connection {
         }
 
         // Parse query response - use cursor's columns since they're already defined
-        let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
-        drop(inner); // Release lock before parsing
-        self.parse_fetch_response(payload, cursor.columns(), &caps)
+        Self::parse_across_packets(&mut inner, &response, |payload| {
+            self.parse_fetch_response(payload, cursor.columns(), &caps)
+        })
+        .await
     }
 
     /// Fetch rows from an implicit result set
@@ -1957,6 +2053,8 @@ impl Connection {
 
         // Skip data flags
         buf.skip(2)?;
+        // False when the packet ends before the terminal message.
+        let mut complete = false;
 
         // Process multiple messages in the response
         while buf.remaining() >= 1 {
@@ -2007,28 +2105,40 @@ impl Connection {
                 }
                 x if x == MessageType::Error as u8 => {
                     // Error message contains row count and cursor info
-                    let (error_code, error_msg, more_rows) = self.parse_error_message_info(&mut buf)?;
-                    has_more_rows = more_rows;
+                    let (error_code, error_msg, _more_rows) = self.parse_error_message_info(&mut buf)?;
+                    // A drained cursor ends with ORA-01403; anything else clean means more rows.
+                    has_more_rows = error_code == 0;
                     if error_code != 0 && error_code != 1403 { // 1403 = no data found
                         return Err(Error::OracleError {
                             code: error_code,
                             message: error_msg,
                         });
                     }
+                    complete = true;
                     break; // Error message marks end of response
+                }
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
                 }
                 x if x == MessageType::Status as u8 => {
                     // Status message - usually marks end
+                    complete = true;
                     break;
                 }
                 x if x == MessageType::EndOfResponse as u8 => {
+                    complete = true;
                     break;
                 }
                 _ => {
                     // Unknown message type - stop processing
+                    complete = true;
                     break;
                 }
             }
+        }
+
+        if !complete {
+            return Err(Error::BufferUnderflow { needed: 1, available: 0 });
         }
 
         Ok(QueryResult {
@@ -2041,6 +2151,97 @@ impl Connection {
     }
 
     /// Parse error message info including cursor_id and row counts
+    /// Skips a server-side piggyback message (message type 23): session state
+    /// synchronisation after `ALTER SESSION`, LTXID and replay context updates.
+    fn skip_server_side_piggyback(&self, buf: &mut ReadBuffer) -> Result<()> {
+        const QUERY_CACHE_INVALIDATION: u8 = 1;
+        const OS_PID_MTS: u8 = 2;
+        const TRACE_EVENT: u8 = 3;
+        const SESS_RET: u8 = 4;
+        const SYNC: u8 = 5;
+        const LTXID: u8 = 7;
+        const AC_REPLAY_CONTEXT: u8 = 8;
+        const EXT_SYNC: u8 = 9;
+
+        let opcode = buf.read_u8()?;
+        match opcode {
+            LTXID => {
+                let len = buf.read_ub4()?;
+                if len > 0 {
+                    buf.skip_raw_bytes_chunked()?;
+                }
+            }
+            QUERY_CACHE_INVALIDATION | TRACE_EVENT => {}
+            OS_PID_MTS => {
+                let _ = buf.read_ub2()?;
+                buf.skip_raw_bytes_chunked()?;
+            }
+            SYNC => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                let elements = buf.read_ub2()?;
+                buf.skip_ub1()?; // length
+                for _ in 0..elements {
+                    if buf.read_ub2()? > 0 {
+                        buf.skip_raw_bytes_chunked()?; // key
+                    }
+                    if buf.read_ub2()? > 0 {
+                        buf.skip_raw_bytes_chunked()?; // value
+                    }
+                    buf.skip_ub2()?; // flags
+                }
+                buf.skip_ub4()?; // overall flags
+            }
+            EXT_SYNC => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+            }
+            AC_REPLAY_CONTEXT => {
+                buf.skip_ub2()?; // number of DTYs
+                buf.skip_ub1()?; // length of DTYs
+                buf.skip_ub4()?; // flags
+                buf.skip_ub4()?; // error code
+                buf.skip_ub1()?; // queue
+                if buf.read_ub4()? > 0 {
+                    buf.skip_raw_bytes_chunked()?; // replay context
+                }
+            }
+            SESS_RET => {
+                buf.skip_ub2()?;
+                buf.skip_ub1()?;
+                let elements = buf.read_ub2()?;
+                if elements > 0 {
+                    buf.skip_ub1()?;
+                    for _ in 0..elements {
+                        if buf.read_ub2()? > 0 {
+                            buf.skip_raw_bytes_chunked()?;
+                        }
+                        if buf.read_ub2()? > 0 {
+                            buf.skip_raw_bytes_chunked()?;
+                        }
+                        buf.skip_ub2()?;
+                    }
+                }
+                buf.skip_ub4()?; // session flags
+                buf.skip_ub4()?; // session id
+                buf.skip_ub2()?; // serial number
+            }
+            other => {
+                return Err(Error::Protocol(format!("unknown server-side piggyback opcode {other}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Servers from 20c on append the SQL type and a checksum to the error info.
+    fn skip_error_info_trailer(&self, buf: &mut ReadBuffer) -> Result<()> {
+        if self.ttc_field_version.load(Ordering::Relaxed) >= crate::constants::ccap_value::FIELD_VERSION_20_1 {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
+        }
+        Ok(())
+    }
+
     fn parse_error_message_info(&self, buf: &mut ReadBuffer) -> Result<(u32, String, bool)> {
         let _call_status = buf.read_ub4()?; // end of call status
         buf.skip_ub2()?; // end to end seq#
@@ -2056,8 +2257,12 @@ impl Connection {
         buf.skip(1)?; // user cursor options
         buf.skip(1)?; // UPI parameter
         let flags = buf.read_u8()?; // flags
-        // Skip rowid - fixed 10 bytes in Oracle format
-        buf.skip(10)?; // rowid is 10 bytes
+        // Rowid: variable-length fields (rba, partition_id, skip 1, block_num, slot_num)
+        buf.skip_ub4()?; // rba
+        buf.skip_ub2()?; // partition_id
+        buf.skip_ub1()?; // skip
+        buf.skip_ub4()?; // block_num
+        buf.skip_ub2()?; // slot_num
         buf.skip_ub4()?; // OS error
         buf.skip(1)?; // statement number
         buf.skip(1)?; // call number
@@ -2089,6 +2294,7 @@ impl Connection {
         // Read extended error info
         let error_num = buf.read_ub4()?;
         let row_count = buf.read_ub8()?;
+        self.skip_error_info_trailer(buf)?;
         let more_rows = row_count > 0 || (flags & 0x20) != 0;
 
         // Read error message if present
@@ -2425,8 +2631,10 @@ impl Connection {
         }
 
         // Parse the response to extract columns and rows
-        let payload = &response[PACKET_HEADER_SIZE..];
-        let mut result = self.parse_query_response(payload, &inner.capabilities)?;
+        let caps = inner.capabilities.clone();
+        let mut result =
+            Self::parse_across_packets(&mut inner, &response, |payload| self.parse_query_response(payload, &caps))
+                .await?;
 
         // Check if any columns are LOB types that require defines
         let has_lob_columns = result.columns.iter().any(|col| col.is_lob());
@@ -2465,12 +2673,11 @@ impl Connection {
             }
 
             // Parse the response with LOB data, using the columns we already know
-            let payload = &define_response[PACKET_HEADER_SIZE..];
-            result = self.parse_query_response_with_columns(
-                payload,
-                &inner.capabilities,
-                &stmt_with_define.columns(),
-            )?;
+            let define_columns = stmt_with_define.columns();
+            result = Self::parse_across_packets(&mut inner, &define_response, |payload| {
+                self.parse_query_response_with_columns(payload, &caps, &define_columns)
+            })
+            .await?;
         }
 
         Ok(result)
@@ -2614,6 +2821,30 @@ impl Connection {
         self.parse_dml_response(payload)
     }
 
+    /// Parses a query or fetch response that may span several TNS packets.
+    ///
+    /// The parsers report a buffer underflow when the packet ends before the
+    /// terminal message (or mid-value); the rest of the response is then read
+    /// and the whole thing parsed again. Rows carrying LOB locators or wide
+    /// columns overflow one packet with a page of only a few dozen rows.
+    async fn parse_across_packets<T>(
+        inner: &mut ConnectionInner,
+        response: &[u8],
+        parse: impl Fn(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        let mut data = response.to_vec();
+        loop {
+            match parse(&data[PACKET_HEADER_SIZE..]) {
+                Err(err @ Error::BufferUnderflow { .. }) => {
+                    if !inner.append_next_packet(&mut data).await {
+                        return Err(err);
+                    }
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Parse query response to extract columns and rows
     ///
     /// Oracle sends multiple messages in a single response:
@@ -2647,12 +2878,18 @@ impl Connection {
         let mut cursor_id: u16 = 0;
         let mut row_count: u64 = 0;
         let mut end_of_response = false;
+        // The server ends a drained cursor with ORA-01403 ("no data found");
+        // a clean completion after a full batch means more rows can be fetched.
+        let mut more_rows = false;
 
         // Bit vector for duplicate column optimization
         // When Some, indicates which columns have actual data (bit=1) vs duplicates (bit=0)
         let mut bit_vector: Option<Vec<u8>> = None;
         // Previous row values for copying duplicates
         let mut previous_row_values: Option<Vec<Value>> = None;
+        // False when the data ran out before a terminal message: the rest of the
+        // response is in the next packet.
+        let mut saw_terminal = false;
 
         // Process messages until we hit end of response or run out of data
         while !end_of_response && buf.remaining() > 0 {
@@ -2699,6 +2936,7 @@ impl Connection {
                             message: error_msg.unwrap_or_default(),
                         });
                     }
+                    more_rows = error_code == 0;
                     end_of_response = true;
                 }
 
@@ -2714,6 +2952,18 @@ impl Connection {
                     let _end_to_end_seq = buf.read_ub2()?;
                     // Note: end_of_response only if supports_end_of_response is false
                     // For now, we assume it's not the end
+                    saw_terminal = true;
+                }
+
+                // End of Response (29) - explicit end marker
+                29 => {
+                    saw_terminal = true;
+                    end_of_response = true;
+                }
+
+                // ServerSidePiggyback (23) - session state updates
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
                 }
 
                 // BitVector (21) - column presence bitmap for sparse results
@@ -2731,16 +2981,22 @@ impl Connection {
 
                 _ => {
                     // Unknown message type - break to avoid parsing errors
+                    saw_terminal = true;
                     break;
                 }
             }
+        }
+
+        if !end_of_response && !saw_terminal {
+            // The packet ended before the terminal message: more data follows.
+            return Err(Error::BufferUnderflow { needed: 1, available: 0 });
         }
 
         Ok(QueryResult {
             columns,
             rows,
             rows_affected: row_count,
-            has_more_rows: false,
+            has_more_rows: more_rows,
             cursor_id,
         })
     }
@@ -3032,8 +3288,15 @@ impl Connection {
         // num key/value pairs - skip for now
         let num_pairs = buf.read_ub2()?;
         for _ in 0..num_pairs {
-            buf.read_bytes_with_length()?;  // text value
-            buf.read_bytes_with_length()?;  // binary value
+            // Each text/binary value is preceded by a UB2 byte count; bytes follow only when it is non-zero.
+            let text_len = buf.read_ub2()?;
+            if text_len > 0 {
+                buf.read_bytes_with_length()?;  // text value
+            }
+            let binary_len = buf.read_ub2()?;
+            if binary_len > 0 {
+                buf.read_bytes_with_length()?;  // binary value
+            }
             buf.skip_ub2()?;  // keyword num
         }
 
@@ -3161,6 +3424,12 @@ impl Connection {
                         let num = crate::types::decode_oracle_number(&bytes)?;
                         Ok(Value::String(num.value))
                     }
+                    OracleType::Varchar | OracleType::Char | OracleType::Long if col.csfrm == 2 => {
+                        // NCHAR / NVARCHAR2 / NCLOB arrive in the national character set, which
+                        // the client negotiates as UTF-16 (big endian).
+                        let units: Vec<u16> = bytes.chunks_exact(2).map(|pair| u16::from_be_bytes([pair[0], pair[1]])).collect();
+                        Ok(Value::String(String::from_utf16_lossy(&units)))
+                    }
                     OracleType::Varchar | OracleType::Char | OracleType::Long => {
                         let s = String::from_utf8_lossy(&bytes).to_string();
                         Ok(Value::String(s))
@@ -3183,6 +3452,44 @@ impl Connection {
                         // Oracle TIMESTAMP WITH TIME ZONE - 13 bytes
                         let ts = crate::types::decode_oracle_timestamp(&bytes)?;
                         Ok(Value::Timestamp(ts))
+                    }
+                    OracleType::Rowid => {
+                        // The bytes hold the ROWID fields in TNS integer encoding.
+                        let mut fields = ReadBuffer::from_slice(&bytes);
+                        let rba = fields.read_ub4()?;
+                        let partition_id = fields.read_ub2()?;
+                        fields.skip(1)?;
+                        let block_num = fields.read_ub4()?;
+                        let slot_num = fields.read_ub2()?;
+                        Ok(Value::RowId(crate::types::RowId::new(rba, partition_id as u16, block_num, slot_num as u16)))
+                    }
+                    OracleType::BinaryFloat => Ok(Value::Float(crate::types::decode_binary_float(&bytes) as f64)),
+                    OracleType::BinaryDouble => Ok(Value::Float(crate::types::decode_binary_double(&bytes))),
+                    OracleType::Boolean => Ok(Value::Boolean(bytes.last().copied().unwrap_or(0) == 1)),
+                    OracleType::IntervalYm if bytes.len() >= 5 => {
+                        // 4 bytes year (biased by 2^31) + 1 byte month (biased by 60)
+                        let years = i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) - 0x8000_0000;
+                        let months = i64::from(bytes[4]) - 60;
+                        let sign = if years < 0 || months < 0 { '-' } else { '+' };
+                        Ok(Value::String(format!("{sign}{:02}-{:02}", years.abs(), months.abs())))
+                    }
+                    OracleType::IntervalDs if bytes.len() >= 11 => {
+                        // 4 bytes days (biased by 2^31), h/m/s (biased by 60), 4 bytes nanoseconds (biased by 2^31)
+                        let days = i64::from(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])) - 0x8000_0000;
+                        let hours = i64::from(bytes[4]) - 60;
+                        let minutes = i64::from(bytes[5]) - 60;
+                        let seconds = i64::from(bytes[6]) - 60;
+                        let nanos = i64::from(u32::from_be_bytes([bytes[7], bytes[8], bytes[9], bytes[10]])) - 0x8000_0000;
+                        let negative = days < 0 || hours < 0 || minutes < 0 || seconds < 0 || nanos < 0;
+                        let sign = if negative { '-' } else { '+' };
+                        Ok(Value::String(format!(
+                            "{sign}{:02} {:02}:{:02}:{:02}.{:06}",
+                            days.abs(),
+                            hours.abs(),
+                            minutes.abs(),
+                            seconds.abs(),
+                            nanos.abs() / 1000
+                        )))
                     }
                     _ => {
                         // Default: return as raw bytes or string
@@ -3507,6 +3814,7 @@ impl Connection {
         let error_code = buf.read_ub4()?;
         // Row count (UB8)
         let _row_count = buf.read_ub8()?;
+        self.skip_error_info_trailer(buf)?;
 
         // Error message
         let error_msg = if error_code != 0 {
@@ -3603,6 +3911,7 @@ impl Connection {
             // Extended error number (UB4)
             let error_num = buf.read_ub4()?;
             let _row_count = buf.read_ub8()?;  // row number (extended)
+            self.skip_error_info_trailer(&mut buf)?;
 
             // Read error message
             let error_msg = if error_num != 0 {
@@ -3683,6 +3992,11 @@ impl Connection {
                 // End of Response (29) - explicit end marker
                 29 => {
                     end_of_response = true;
+                }
+
+                // ServerSidePiggyback (23) - session state updates
+                x if x == MessageType::ServerSidePiggyback as u8 => {
+                    self.skip_server_side_piggyback(&mut buf)?;
                 }
 
                 _ => {
@@ -3786,10 +4100,8 @@ impl Connection {
         // Row count (UB8) - this is the rows affected!
         let row_count = buf.read_ub8()?;
 
-        // Fields added in Oracle Database 20c (TTC field version >= 16)
-        // We always skip these since we support Oracle 20c+
-        buf.skip_ub4()?; // sql_type
-        buf.skip_ub4()?; // server_checksum
+        // Fields added in Oracle Database 20c
+        self.skip_error_info_trailer(buf)?;
 
         // Error message
         let error_msg = if error_code != 0 {
@@ -3840,7 +4152,7 @@ impl Connection {
             let _oid = buf.read_bytes_with_length()?; // OID
             buf.skip_ub2()?; // version
             buf.skip_ub2()?; // charset_id
-            let _csfrm = buf.read_u8()?; // charset form
+            let csfrm = buf.read_u8()?; // charset form (2 = national character set)
             let max_size = buf.read_ub4()?;
 
             // For TTC field version >= 12.2 (8), skip oaccolid
@@ -3848,7 +4160,7 @@ impl Connection {
                 buf.skip_ub4()?; // oaccolid
             }
 
-            let _nulls_allowed = buf.read_u8()?;
+            let nulls_allowed = buf.read_u8()?;
             buf.skip_ub1()?; // v7 length of name
             let name = buf.read_string_with_ub4_length()?.unwrap_or_default();
             let _schema = buf.read_string_with_ub4_length()?; // schema
@@ -3895,6 +4207,8 @@ impl Connection {
             col.data_size = if max_size > 0 { max_size } else { buffer_size };
             col.precision = precision as i16;
             col.scale = scale as i16;
+            col.csfrm = csfrm;
+            col.nullable = nulls_allowed != 0;
             columns.push(col);
         }
 
@@ -4265,9 +4579,12 @@ impl Connection {
             return self.parse_lob_error(&mut buf);
         }
 
-        // Parse LOB data response
-        let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_lob_read_response(payload, locator)
+        // Parse LOB data response. The trailing locator may straddle a packet
+        // boundary, which the terminal-message scan cannot tell from the end.
+        Self::parse_across_packets(&mut inner, &response, |payload| {
+            self.parse_lob_read_response(payload, locator)
+        })
+        .await
     }
 
     /// Parse LOB read response
@@ -5023,8 +5340,13 @@ impl Connection {
 
         // Build MARKER packet header
         let packet_len = PACKET_HEADER_SIZE + 3; // Header + 3 bytes payload
-        packet_buf.write_u16_be(packet_len as u16)?;
-        packet_buf.write_u16_be(0)?; // Checksum
+        if inner.large_sdu {
+            // The length field is 32 bits wide once a large SDU was negotiated.
+            packet_buf.write_u32_be(packet_len as u32)?;
+        } else {
+            packet_buf.write_u16_be(packet_len as u16)?;
+            packet_buf.write_u16_be(0)?; // Checksum
+        }
         packet_buf.write_u8(PacketType::Marker as u8)?;
         packet_buf.write_u8(0)?; // Flags
         packet_buf.write_u16_be(0)?; // Header checksum

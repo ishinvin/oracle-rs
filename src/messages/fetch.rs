@@ -49,14 +49,20 @@ impl FetchMessage {
         }
     }
 
-    /// Build the fetch request packet
-    pub fn build_request(&self, _caps: &Capabilities) -> Result<Bytes> {
+    /// Build the fetch request packet for the negotiated framing: with a large
+    /// SDU the packet length is 32 bits wide, the function header carries the
+    /// running sequence number, and servers on TTC field version 18+ (23ai)
+    /// expect the 8-byte token after it.
+    pub fn build_request_with_sdu(&self, caps: &Capabilities, large_sdu: bool, sequence_number: u8) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
 
         // Write message header
         buf.write_u8(MessageType::Function as u8)?;
         buf.write_u8(FunctionCode::Fetch as u8)?;
-        buf.write_u8(0)?; // Sequence number
+        buf.write_u8(sequence_number)?;
+        if caps.ttc_field_version >= 18 {
+            buf.write_ub8(0)?; // token number
+        }
 
         // Write fetch body
         buf.write_ub4(self.cursor_id as u32)?;
@@ -70,13 +76,17 @@ impl FetchMessage {
 
         // Build packet with header
         let payload = buf.freeze();
-        let packet_len = PACKET_HEADER_SIZE + payload.len();
+        let packet_len = PACKET_HEADER_SIZE + 2 + payload.len();
 
         let mut packet = BytesMut::with_capacity(packet_len);
 
         // Packet header
-        packet.put_u16(packet_len as u16); // Length
-        packet.put_u16(0); // Checksum
+        if large_sdu {
+            packet.put_u32(packet_len as u32);
+        } else {
+            packet.put_u16(packet_len as u16); // Length
+            packet.put_u16(0); // Checksum
+        }
         packet.put_u8(PacketType::Data as u8);
         packet.put_u8(0); // Flags
         packet.put_u16(0); // Header checksum
@@ -117,7 +127,7 @@ mod tests {
         let msg = FetchMessage::new(1, 100);
         let caps = Capabilities::new();
 
-        let packet = msg.build_request(&caps).unwrap();
+        let packet = msg.build_request_with_sdu(&caps, false, 0).unwrap();
 
         // Check packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);
